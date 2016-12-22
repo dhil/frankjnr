@@ -2,7 +2,7 @@ module Shonky.Semantics where
 
 import Control.Monad
 import Debug.Trace
-import System.IO.Unsafe
+import System.IO
 
 import qualified Data.Map.Strict as M
 
@@ -41,18 +41,48 @@ data Frame
   | Txt Env [Char] [Either Char Exp]
   deriving Show
 
+-- This pretty-printer more-or-less does the right thing for rendering
+-- Frank values encoded in shonky.
+--
+-- One thing it still gets wrong is printing 'nil' for an empty
+-- string, because it does not know the type.
+--
+-- Another problem is that for complex values (including computations)
+-- it resorts to invoking show.
+
 ppVal :: Val -> String
-ppVal (VA s) = "'" ++ s
-ppVal (VI n) = show n
-ppVal p@(_ :&& _) = "[" ++ ppListVal p
-ppVal (VX s) = "\"" ++ s ++ "\""
-ppVal v = show v
+ppVal (VA s)                           = "'" ++ s   -- TODO: error message here?
+ppVal (VI n)                           = show n
+ppVal (VX [c])                         = "'" ++ [c] ++ "'"
+ppVal v@(VA "cons" :&& (VX [_] :&& _)) = "\"" ++ ppStringVal v ++ "\""
+ppVal (VA "cons" :&& (v :&& w))        = "[" ++ ppVal v ++ ppListVal w ++ "]"
+ppVal (VA "nil" :&& _)                 = "[]"
+ppVal (VA k :&& v)                     = k ++ ppConsArgs v
+ppVal v                                = "[COMPLEX VALUE: " ++ show v ++ "]"
+
+-- parentheses if necessary
+ppValp :: Val -> String
+ppValp v@(VA "cons" :&& (VX [_] :&& _)) = ppVal v   -- string
+ppValp v@(VA _ :&& VA "")               = ppVal v   -- nullary constructor
+ppValp v@(VA _ :&& _)                   = "(" ++ ppVal v ++ ")"
+ppValp v                                = ppVal v
+
+ppConsArgs :: Val -> String
+ppConsArgs (v :&& w) = " " ++ ppValp v ++ ppConsArgs w
+ppConsArgs (VA "")   = ""
+ppConsArgs v         = "[BROKEN CONSTRUCTOR ARGUMENTS: " ++ ppVal v ++ "]"
+
+ppStringVal :: Val -> String
+ppStringVal (v :&& VA "")                  = ppStringVal v
+ppStringVal (VA "cons" :&& (VX [c] :&& v)) = c : ppStringVal v
+ppStringVal (VA "nil")                     = ""
+ppStringVal v                              = "[BROKEN STRING: " ++ ppVal v ++ "]"
 
 ppListVal :: Val -> String
-ppListVal (v :&& VA "") = ppVal v ++ "]"
-ppListVal (v :&& vs) = ppVal v ++ "," ++ ppListVal vs
-ppListVal (VA "") = "]"
-ppListVal v = ppVal v
+ppListVal (v :&& VA "")             = ppListVal v
+ppListVal (VA "cons" :&& (v :&& w)) = ", " ++ ppVal v ++ ppListVal w
+ppListVal (VA "nil")                = ""
+ppListVal v                         = "[BROKEN LIST: " ++ ppVal v ++ "]"
 
 plus :: Env -> [Comp] -> Val
 plus g [a1,a2] = VI (f a1 + f a2)
@@ -68,18 +98,8 @@ minus g [a1,a2] = VI (f a1 - f a2)
           _ -> error "minus: argument not an integer"
 minus g _ = error "minus: incorrect number of arguments, expected 2."
 
-getChar' :: Env -> [Comp] -> Val
-getChar' g [] = VX [c]
-  where c = unsafePerformIO getChar
-getChar' g _ = error "getChar: incorrect number of arguments, expected 0."
-
-putChar' :: Env -> [Comp] -> Val
-putChar' g [Ret (VX [c])] = unsafePerformIO (do Prelude.putChar c
-                                                return $ VA "unit")
-
 builtins :: M.Map String (Env -> [Comp] -> Val)
-builtins = M.fromList [("plus", plus), ("minus", minus)
-                      ,("getChar", getChar'), ("putChar", putChar')]
+builtins = M.fromList [("plus", plus), ("minus", minus)]
 
 fetch :: Env -> String -> Val
 fetch g y = go g where
@@ -117,6 +137,20 @@ consume _ (Qed v               : ls) = consume v ls
 consume v (Def g dvs x des e   : ls) = define g ((x := v) : dvs) des e ls
 consume v (Txt g cs ces        : ls) = combine g (revapp (txt v) cs) ces ls
 consume v []                         = Ret v
+
+-- inch and ouch commands in the IO monad
+ioHandler :: Comp -> IO Val
+ioHandler (Ret v) = return v
+ioHandler (Call "inch" [] ks) =
+  do c <- getChar
+     -- HACK: for some reason backspace seems to produce '\DEL' instead of '\b'
+     let c' = if c == '\DEL' then '\b' else c
+     ioHandler (consume (VX [c']) (reverse ks))
+ioHandler comp@(Call "ouch" [VX [c]] ks) =
+  do putChar c
+     hFlush stdout
+     ioHandler (consume (VA "unit" :&& VA "") (reverse ks))
+ioHandler (Call c vs ks) = error $ "Unhandled command: " ++ c ++ concat (map (\v -> " " ++ ppVal v) vs)
 
 -- A helper to simplify strings (list of characters)
 -- this allows regular list append [x|xs] to function like [|`x``xs`|] but
@@ -159,8 +193,11 @@ apply (VF g _ pes) cs ls = tryRules g pes cs ls
 apply (VB x g) cs ls = case M.lookup x builtins of
   Just f -> consume (f g cs) ls
   Nothing -> error $ concat ["apply: ", x, " not a builtin"]
-apply (VA a) cs ls = command a (map (\ (Ret v) -> v) cs) [] ls
+apply (VA a) cs ls =
+  -- commands are not handlers, so the cs must all be values
+  command a (map (\ (Ret v) -> v) cs) [] ls
 apply (VC (Ret v)) [] ls = consume v ls
+apply (VC (Call a vs ks)) [] ls = command a vs ks ls
 apply (VK ks) [Ret v] ls = consume v (revapp ks ls)
 apply f cs ls = error $ concat ["apply: ", show f, show cs, show ls]
 
@@ -253,13 +290,8 @@ txt (VX a)     = a
 txt (u :&& v)  = txt u ++ txt v
 
 envBuiltins :: Env
-envBuiltins = Empty :/ [DF "strcat" []
-                        [([PV (VPV "x"), PV (VPV "y")],
-                          EX [Right (EV "x"), Right (EV "y")])]
-                       ,DF "plus" [] []
-                       ,DF "minus" [] []
-                       ,DF "getChar" [] []
-                       ,DF "putChar" [] []]
+envBuiltins = Empty :/ [DF "plus" [] []
+                       ,DF "minus" [] []]
 
 prog :: Env -> [Def Exp] -> Env
 prog g ds = g' where

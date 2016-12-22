@@ -135,7 +135,7 @@ collectMHNames [] = []
 getHdrDefs :: [TopTm Raw] -> [MHCls] -> [MHCls]
 getHdrDefs ((MkClsTm cls) : xs) ys = getHdrDefs xs (cls : ys)
 getHdrDefs (_ : xs) ys = getHdrDefs xs ys
-getHdrDefs [] ys = ys
+getHdrDefs [] ys = reverse ys
 
 splitTopTm :: [TopTm Raw] -> ([MHSig], [MHCls], [DataT Raw], [Itf Raw])
 splitTopTm xs = (getHdrSigs xs, getHdrDefs xs [], dts, itfs)
@@ -204,6 +204,10 @@ refineDataT :: DataT Raw -> Refine (TopTm Refined)
 refineDataT d@(MkDT dt es ps ctrs) =
   if uniqueIds ps && uniqueIds es then
      do putTMap (M.fromList $ zip ps (map MkTVar ps))
+        -- FIXME: this is the wrong test.
+        --   * We should account for empty abilities.
+        --   * If neccessary, we should add a "£" even if there are
+        --   other ability variables.
         let es' = if dtContainsCType d && null es then ["£"] else es
         putEVSet (S.fromList es')
         ctrs' <- mapM refineCtr ctrs
@@ -248,7 +252,7 @@ refinePeg (MkPeg ab ty) = do ab' <- refineAb ab
 
 refineDTAbs :: [Ab Raw] -> [Id] -> Refine ([Ab Raw])
 refineDTAbs abs es = return xs
-  where xs = map (\v -> MkAb v M.empty) (take n $ repeat varepi)
+  where xs = abs ++ map (\v -> MkAb v M.empty) (take n $ repeat varepi)
 
         n = length es - length abs
 
@@ -465,19 +469,12 @@ builtinDataTs = [MkDT "List" [] ["X"] [MkCtr "cons" [MkTVar "X"
 
 
 builtinItfs :: [Itf Refined]
-builtinItfs = [MkItf "Console" [] [MkCmd "putStrLn" [MkStringTy]
-                                   (MkDTTy "Unit" [] [])
-                                  ,MkCmd "getStr" [] MkStringTy]
-              ,MkItf "CursesConsole" [] [MkCmd "inch" [] MkCharTy
-                                        ,MkCmd "ouch" [MkCharTy]
-                                         (MkDTTy "Unit" [] [])]]
+builtinItfs = [MkItf "Console" [] [MkCmd "inch" [] MkCharTy
+                                  ,MkCmd "ouch" [MkCharTy]
+                                                (MkDTTy "Unit" [] [])]]
 
 builtinMHDefs :: [MHDef Refined]
-builtinMHDefs = [MkDef "strcat"
-                 (MkCType [MkPort (MkAdj M.empty) MkStringTy
-                          ,MkPort (MkAdj M.empty) MkStringTy]
-                  (MkPeg (MkAb (MkAbVar "£") M.empty) MkStringTy)) []] ++
-                (map makeIntBinOp "+-")
+builtinMHDefs = map makeIntBinOp "+-"
 
 builtinMHs :: [IPair]
 builtinMHs = map add builtinMHDefs

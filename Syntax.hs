@@ -6,6 +6,9 @@
 module Syntax where
 
 import qualified Data.Map.Strict as M
+import Data.List
+
+import qualified Text.PrettyPrint as PP
 
 {-------------------}
 {-- Syntax description: raw syntax comes from the parser and preprocessed into
@@ -17,11 +20,13 @@ class NotRaw a where
 class NotDesugared a where
   idNotDesugared :: a -> a
 
+-- output from the parser
 data Raw = MkRaw
 
 instance NotDesugared Raw where
   idNotDesugared = Prelude.id
 
+-- well-formed AST (after tidying up the output from the parser)
 data Refined = MkRefined
 
 instance NotDesugared Refined where
@@ -30,6 +35,9 @@ instance NotDesugared Refined where
 instance NotRaw Refined where
   idNotRaw = Prelude.id
 
+-- desugaring of types:
+--   * type variables are given unique names
+--   * strings are lists of characters
 data Desugared = MkDesugared
 
 instance NotRaw Desugared where
@@ -57,6 +65,9 @@ data MHCls = MkMHCls Id (Clause Raw)
 data MHDef a = MkDef Id (CType a) [Clause a]
            deriving (Show, Eq)
 
+{- MH here = 'operator' in the paper. Operator here doesn't have a name
+   in the paper. -}
+
 data Operator = MkMono Id | MkPoly Id | MkCmdId Id
               deriving (Show, Eq)
 
@@ -82,11 +93,13 @@ data TopTm a where
 deriving instance (Show) (TopTm a)
 deriving instance (Eq) (TopTm a)
 
+-- Tm here = 'construction' in the paper
+
 data Tm a where
   MkRawId :: Id -> Tm Raw
   MkRawComb :: Id -> [Tm Raw] -> Tm Raw
   MkSC :: SComp a -> Tm a
-  MkLet :: Tm a
+  MkLet :: Tm a    -- placeholder
   MkStr :: String -> Tm a
   MkInt :: Integer -> Tm a
   MkChar :: Char -> Tm a
@@ -119,6 +132,7 @@ data Cmd a = MkCmd Id [VType a] (VType a)
 data Pattern = MkVPat ValuePat | MkCmdPat Id [ValuePat] Id | MkThkPat Id
              deriving (Show, Eq)
 
+-- TODO: should we compile away string patterns into list of char patterns?
 data ValuePat = MkVarPat Id | MkDataPat Id [ValuePat] | MkIntPat Integer
               | MkCharPat Char | MkStrPat String
               deriving (Show, Eq)
@@ -255,3 +269,67 @@ getOpName :: Operator -> Id
 getOpName (MkMono x) = x
 getOpName (MkPoly x) = x
 getOpName (MkCmdId x) = x
+
+-- Syntax pretty printing facilities
+
+(<+>) = (PP.<+>)
+(<>) = (PP.<>)
+text = PP.text
+
+type Doc = PP.Doc
+
+-- Only to be applied to identifiers representing rigid or flexible
+-- metavariables (type or effect).
+trimVar :: Id -> Id
+trimVar = takeWhile (/= '$')
+
+ppVType :: VType a -> Doc
+ppVType (MkDTTy x abs xs) = text x <+> absRep <+> xsRep
+  where absRep = foldl abToDoc PP.empty abs'
+        abToDoc acc ab = ab <+> acc
+        abs' = map ppAb abs
+        xsRep = foldl (<+>) PP.empty $ map ppParenVType xs
+ppVType (MkSCTy (MkCType ps q)) = text "{" <> ports <> peg <> text "}"
+  where
+    ports = case map ppPort ps of
+      [] -> PP.empty
+      xs -> foldl (\acc x -> x <+> text "-> " <> acc) PP.empty (reverse xs)
+
+    peg = ppPeg q
+ppVType (MkTVar x) = text x
+ppVType (MkRTVar x) = text x
+ppVType (MkFTVar x) = text x
+ppVType MkStringTy = text "String"
+ppVType MkIntTy = text "Int"
+ppVType MkCharTy = text "Char"
+
+ppParenVType :: VType a -> Doc
+ppParenVType v@(MkDTTy _ _ _) = text "(" <+> ppVType v <+> text ")"
+ppParenVType v = ppVType v
+
+ppPort :: Port a -> Doc
+ppPort (MkPort adj ty) = ppAdj adj <> ppVType ty
+
+ppPeg :: Peg a -> Doc
+ppPeg (MkPeg ab ty) = ppAb ab <> ppVType ty
+
+ppAdj :: Adj a -> Doc
+ppAdj (MkAdj m) | M.null m = PP.empty
+ppAdj (MkAdj m) = text "<" <> ppItfMap m <> text ">"
+
+ppAb :: Ab a -> Doc
+ppAb (MkAb v m) | M.null m = text "[" <> ppAbMod v <> text "]"
+ppAb (MkAb v m) =
+  text "[" <> ppAbMod v <> PP.comma <+> ppItfMap m <> text "]"
+
+ppAbMod :: AbMod a -> Doc
+ppAbMod MkEmpAb = text "@"
+ppAbMod (MkAbVar x) = text x
+ppAbMod (MkAbRVar x) = text x
+ppAbMod (MkAbFVar x) = text x
+
+ppItfMap :: ItfMap a -> Doc
+ppItfMap m = PP.hsep $ intersperse PP.comma $ map ppItfMapPair $ M.toList m
+ where ppItfMapPair :: (Id, [VType a]) -> Doc
+       ppItfMapPair (x, vs) = 
+         text x <+> (foldl (<+>) PP.empty $ map ppParenVType vs)
