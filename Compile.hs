@@ -1,3 +1,5 @@
+{-# LANGUAGE ScopedTypeVariables #-}
+
 -- Compile Frank to Shonky
 module Compile where
 
@@ -69,15 +71,16 @@ initialiseItfMap st xs = st { imap = foldl f (imap st) xs }
 
 compileTopTm :: NotRaw a => TopTm a -> Compile [S.Def S.Exp]
 compileTopTm (MkDataTm x) = compileDatatype x
-compileTopTm (MkDefTm x) = do def <- compileMHDef x
-                              return $ [def]
+compileTopTm (MkDefTm x@(MkDef id _ _)) = if isBuiltin id then return []
+                                          else do def <- compileMHDef x
+                                                  return $ [def]
 compileTopTm _ = return [] -- interfaces are ignored for now. add to a map?
 
 -- a constructor is then just a cons cell of its arguments
 -- how to do pattern matching correctly? maybe they are just n-adic functions
 -- too? pure ones are just pure functions, etc.
 compileDatatype :: NotRaw a => DataT a -> Compile [S.Def S.Exp]
-compileDatatype (MkDT _ _ _ xs) = mapM compileCtr xs
+compileDatatype (MkDT _ _ xs) = mapM compileCtr xs
 
 -- nonNullary :: [Ctr a] -> Compile [Ctr a]
 -- nonNullary ((MkCtr id []) : xs) = do addAtom id
@@ -118,13 +121,17 @@ compileClause (MkCls ps tm) = do ps' <- mapM compilePattern ps
                                  e <- compileTm tm
                                  return (ps', e)
 
-compilePattern :: Pattern -> Compile S.Pat
+compilePattern :: NotRaw a => Pattern a -> Compile S.Pat
 compilePattern (MkVPat x) = S.PV <$> compileVPat x
 compilePattern (MkCmdPat cmd xs k) = do xs' <- mapM compileVPat xs
                                         return $ S.PC cmd xs' k
 compilePattern (MkThkPat id) = return $ S.PT id
 
-compileVPat :: ValuePat -> Compile S.VPat
+-- The current version simply represents Frank characters as one
+-- character Shonky strings and Frank strings as a Shonky datatype
+-- with "cons" and "nil" constructors.
+
+compileVPat :: NotRaw a => ValuePat a -> Compile S.VPat
 compileVPat (MkVarPat id) = return $ S.VPV id
 compileVPat (MkDataPat id xs) =
   do case xs of
@@ -132,15 +139,19 @@ compileVPat (MkDataPat id xs) =
        xs -> do xs' <- mapM compileVPat xs
                 return $ foldr1 (S.:&:) $ (S.VPA id) : (xs' ++ [S.VPA ""])
 compileVPat (MkIntPat n) = return $ S.VPI n
-compileVPat (MkStrPat s) = return $ S.VPX $ map Left s
+compileVPat ((MkStrPat s) :: ValuePat a) = compileVPat (compileStrPat s) where
+  compileStrPat :: NotRaw a => String -> ValuePat a
+  compileStrPat []     = MkDataPat "nil" []
+  compileStrPat (c:cs) = MkDataPat "cons" [MkCharPat c, compileStrPat cs]
 compileVPat (MkCharPat c) = return $ S.VPX [Left c]
 
 compileTm :: NotRaw a => Tm a -> Compile S.Exp
 compileTm (MkSC sc) = compileSComp sc
-compileTm MkLet = return $ S.EV "let"
-compileTm (MkStr s) -- list of characters
-  | s == "" = return $ S.EA "nil" S.:& S.EA "" -- empty string
-  | otherwise = return $ S.EX $ map Left s
+-- compileTm MkLet = return $ S.EV "let"
+compileTm (MkStr s :: Tm a) = compileDataCon (f s) where
+  f :: String -> DataCon a
+  f [] = MkDataCon "nil" []
+  f (c:cs) = MkDataCon "cons" [MkChar c, MkDCon $ f cs]
 compileTm (MkInt n) = return $ S.EI n
 compileTm (MkChar c) = return $ S.EX [Left c]
 compileTm (MkTmSeq t1 t2) = (S.:!) <$> compileTm t1 <*> compileTm t2
@@ -149,7 +160,7 @@ compileTm (MkDCon d) = compileDataCon d
 
 compileUse :: NotRaw a => Use a -> Compile S.Exp
 compileUse (MkOp op) = compileOp op
-compileUse (MkApp op xs) = (S.:$) <$> compileOp op <*> mapM compileTm xs
+compileUse (MkApp use xs) = (S.:$) <$> compileUse use <*> mapM compileTm xs
 
 compileDataCon :: NotRaw a => DataCon a -> Compile S.Exp
 compileDataCon (MkDataCon id xs) = do xs' <- mapM compileTm xs
@@ -159,10 +170,19 @@ compileSComp :: NotRaw a => SComp a -> Compile S.Exp
 compileSComp (MkSComp xs) = S.EF <$> pure [[]] <*> mapM compileClause xs
 
 compileOp :: Operator -> Compile S.Exp
-compileOp (MkMono id) = do b <- isAtom id
-                           return $ if b then S.EA id
-                                    else S.EV id
-compileOp (MkPoly id) = return $ S.EV id
+compileOp (MkMono id) = case M.lookup id builtins of
+  Just v -> return $ S.EV v
+  Nothing ->  do b <- isAtom id
+                 return $ if b then S.EA id
+                          else S.EV id
+compileOp (MkPoly id) = case M.lookup id builtins of
+  Just v -> return $ S.EV v
+  Nothing -> return $ S.EV id
 compileOp (MkCmdId id) = return $ S.EA id
 
--- use the mappings of interface names to obtain the commands
+builtins :: M.Map String String
+builtins = M.fromList [("+", "plus")
+                      ,("-", "minus")]
+
+isBuiltin :: String -> Bool
+isBuiltin x = M.member x builtins

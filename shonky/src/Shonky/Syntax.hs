@@ -8,16 +8,17 @@ import Data.List
 import qualified Data.Map as M
 
 data Exp
-  = EV String
-  | EI Integer
-  | EA String
-  | Exp :& Exp
-  | Exp :$ [Exp]
-  | Exp :! Exp
-  | Exp :// Exp
-  | EF [[String]] [([Pat], Exp)]
-  | [Def Exp] :- Exp
-  | EX [Either Char Exp]
+  = EV String                     -- variable
+  | EI Integer                    -- integer
+  | EA String                     -- atom
+  | Exp :& Exp                    -- cons
+  | Exp :$ [Exp]                  -- application
+  | Exp :! Exp                    -- composition (;)
+  | Exp :// Exp                   -- composition (o)
+  | EF [[String]] [([Pat], Exp)]  -- operator
+  | [Def Exp] :- Exp              -- ? (not used by Frank)
+  | EX [Either Char Exp]          -- string concatenation expression
+                                  -- (only used for characters in source Frank (Left c), but used by strcat)
   deriving (Show, Eq)
 infixr 6 :&
 infixl 5 :$
@@ -50,7 +51,7 @@ pGap :: P ()
 pGap = () <$ many (pLike pChar isSpace)
 
 pId :: P String
-pId = do c <- pLike pChar (\c -> isAlpha c || c == '_')
+pId = do c <- pLike pChar (\c -> isAlpha c || c == '_' || c == '%')
          cs <- many (pLike pChar (\c -> isAlphaNum c || c == '\''))
          return (c : cs)
 
@@ -178,13 +179,13 @@ ppProg xs = unlines $ map ppDef xs
 
 ppDef :: Def Exp -> String
 ppDef (id := e) = id ++ " -> " ++ ppExp e
-ppDef (DF id _ _) | isBuiltin id = "" -- builtins not output
-ppDef (DF id [] ys) = ppCSep (\x -> id ++ (ppClause x)) (reverse ys)
-ppDef (DF id xs ys) = unlines hdr
+ppDef (DF id [] [])  = error "ppDef invariant broken: empty Def Exp detected."
+ppDef (DF id [] ys) = ppCSep (\x -> id ++ (ppClause x)) ys
+ppDef p@(DF id xs ys) = unlines hdr
   where hdr = [header, cs]
         header = id ++ "(" ++ args ++ "):"
         args = intercalate "," (map (intercalate " ") xs)
-        cs = unlines $ f $ map (\x -> id ++ (ppClause x)) (reverse ys)
+        cs = unlines $ f $ map (\x -> id ++ (ppClause x)) ys
         f (xs:[]) = [xs] -- don't add separator in last case
         f (xs:xss) = (xs ++ ",") : f xss
 
@@ -209,22 +210,10 @@ ppClause (ps, e) = rhs ++ " -> " ++ lhs
   where rhs = "(" ++ (ppCSep ppPat ps) ++ ")"
         lhs = ppExp e
 
-ppBuiltins :: M.Map String String
-ppBuiltins = M.fromList [("+", "plus")
-                        ,("-", "minus")
-                        ,("strcat","strcat")]
-
-isBuiltin :: String -> Bool
-isBuiltin x = M.member x ppBuiltins
-
 ppExp :: Exp -> String
-ppExp (EV x) = case M.lookup x ppBuiltins of
-  Just v -> v
-  Nothing -> x
+ppExp (EV x) = x
 ppExp (EI n) = show n
-ppExp (EA x)
-  | x `elem` listCtrs = ""
-  | otherwise = "'" ++ x
+ppExp (EA x) = "'" ++ x
 ppExp (EX xs) = "[|" ++ ppText ppExp xs
 ppExp (e :& e') | isListExp e = "[" ++ ppListExp e'
 ppExp p@(_ :& _) = "[" ++ ppExp' p
@@ -241,7 +230,6 @@ ppExp' (e :& es) = ppExp e ++ "," ++ ppExp' es
 ppExp' e = ppExp e
 
 isListExp :: Exp -> Bool
-isListExp (EA v) | v `elem` listCtrs = True
 isListExp (e :& _) = isListExp e
 isListExp _ = False
 
@@ -261,9 +249,7 @@ ppPat (PC cmd ps k) = "{'" ++ cmd ++ "(" ++ args ++ ") -> " ++ k ++ "}"
 ppVPat :: VPat -> String
 ppVPat (VPV x) = x
 ppVPat (VPI n) = show n
-ppVPat (VPA x)
-  | x `elem` listCtrs = ""
-  | otherwise = "'" ++ x
+ppVPat (VPA x) = "'" ++ x
 ppVPat (VPX xs) = "[|" ++ ppText ppVPat xs
 ppVPat (v1 :&: v2 :&: v3) = ppVPat (v1 :&: (v2 :&: v3))
 ppVPat (v :&: v') | isListPat v = "[" ++ ppVPatList v'
@@ -281,9 +267,5 @@ ppVPat' (v :&: vs) = ppVPat v ++ "," ++ ppVPat' vs
 ppVPat' v = ppVPat v
 
 isListPat :: VPat -> Bool
-isListPat (VPA v) | v `elem` listCtrs = True
 isListPat (v :&: _) = isListPat v
 isListPat _ = False
-
-listCtrs :: [String]
-listCtrs = ["nil", "cons"]
