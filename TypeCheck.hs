@@ -38,10 +38,10 @@ find (MkCmdId x) =
                   (show $ ppAb amb)
        Just ps ->
          do addMark
-            qs' <- mapM makeFlexible qs
+            qs' <- mapM makeFlexibleTyArg qs
             ts' <- mapM makeFlexible ts
             y' <- makeFlexible y
-            mapM (uncurry unify) (zip ps qs')
+            mapM (uncurry unifyTyArg) (zip ps qs')
             return $ MkSCTy $
               MkCType (map (\x -> MkPort idAdj x) ts') (MkPeg amb y')
 find x = getContext >>= find'
@@ -75,12 +75,13 @@ inAmbient adj m = do amb <- getAmbient
                      putAmbient amb
                      return a
 
-lkpItf :: Id -> Ab Desugared -> Contextual (Maybe [VType Desugared])
-lkpItf itf (MkAb v m) = case M.lookup itf m of
-  Nothing -> lkpItfInAbMod itf v
-  Just xs -> return $ Just xs
+lkpItf :: Id -> Ab Desugared -> Contextual (Maybe [TyArg Desugared])
+lkpItf itf (MkAb v m) =
+  case M.lookup itf m of
+    Nothing -> lkpItfInAbMod itf v
+    Just xs -> return $ Just xs
 
-lkpItfInAbMod :: Id -> AbMod Desugared -> Contextual (Maybe [VType Desugared])
+lkpItfInAbMod :: Id -> AbMod Desugared -> Contextual (Maybe [TyArg Desugared])
 lkpItfInAbMod itf (MkAbFVar x) = getContext >>= find'
   where find' BEmp = return Nothing
         find' (es :< FlexMVar y (AbDefn ab)) | x == y = lkpItf itf ab
@@ -93,6 +94,13 @@ instantiate (MkPoly _) ty = addMark >> makeFlexible ty
 instantiate _ ty = return ty
 
 -- TODO: change output of check to Maybe String?
+
+-- infer the type of a use w.r.t. the given program
+inferEvalUse :: Prog Desugared -> Use Desugared ->
+                Either String (VType Desugared)
+inferEvalUse p use = runExcept $ evalFreshMT $ evalStateT comp initTCState
+  where comp = unCtx $ do _ <- initContextual p
+                          inferUse use
 
 -- Main typechecking function
 check :: Prog Desugared -> Either String (Prog Desugared)
@@ -113,10 +121,14 @@ checkMHDef (MkDef id ty@(MkCType ps q) cs) =
 -- Functions below implement the typing rules described in the paper.
 inferUse :: Use Desugared -> Contextual (VType Desugared)
 inferUse (MkOp x) = find x >>= (instantiate x)
-inferUse (MkApp f xs) =
-  do ty <- find f >>= (instantiate f)
+inferUse app@(MkApp f xs) =
+  do ty <- inferUse f
      discriminate ty
-  where checkArgs :: [Port Desugared] -> [Tm Desugared] -> Contextual ()
+  where appAbError :: String -> Contextual ()
+        appAbError msg | inDebugMode = throwError (msg ++ " in " ++ show app)
+        appAbError msg = throwError msg
+
+        checkArgs :: [Port Desugared] -> [Tm Desugared] -> Contextual ()
         checkArgs ps xs = mapM_ (uncurry checkArg) (zip ps xs)
 
         checkArg :: Port Desugared -> Tm Desugared -> Contextual ()
@@ -125,23 +137,35 @@ inferUse (MkApp f xs) =
         discriminate :: VType Desugared -> Contextual (VType Desugared)
         discriminate ty@(MkSCTy (MkCType ps (MkPeg ab ty'))) =
           do amb <- getAmbient
-             unifyAb amb ab
+             catchError (unifyAb amb ab) appAbError
              checkArgs ps xs
              return ty'
-        discriminate ty@(MkFTVar x) = do mty <- findFTVar x
-                                         case mty of
-                                           Nothing -> errTy ty
-                                           Just ty' -> discriminate ty'
+        discriminate ty@(MkFTVar x) =
+          do mty <- findFTVar x
+             case mty of
+               Nothing ->
+                 -- TODO: check that this is correct
+                 do addMark
+                    amb <- getAmbient
+                    ps <- mapM (\_ -> freshPort "X") xs
+                    q@(MkPeg ab ty')  <- freshPegWithAb amb "Y"
+                    unify ty (MkSCTy (MkCType ps q))
+                    return ty'
+                 -- errTy ty
+               Just ty' -> discriminate ty'
         discriminate ty = errTy ty
 
+        -- TODO: tidy.
+        -- We don't need to report an error here, but rather generate
+        -- appropriate fresh type variables as above.
         errTy ty = throwError $
-                   "application:expected suspended computation but got " ++
+                   "application (" ++ show (MkApp f xs) ++ 
+                   "): expected suspended computation but got " ++
                    (show $ ppVType ty)
 
 checkTm :: Tm Desugared -> VType Desugared -> Contextual ()
 checkTm (MkSC sc) ty = checkSComp sc ty
-checkTm MkLet _ = return ()
-checkTm (MkStr _) ty = unify (desugaredStrTy []) ty
+checkTm (MkStr _) ty = unify desugaredStrTy ty
 checkTm (MkInt _) ty = unify MkIntTy ty
 checkTm (MkChar _) ty = unify MkCharTy ty
 checkTm (MkTmSeq tm1 tm2) ty = do ftvar <- freshMVar "seq"
@@ -150,12 +174,11 @@ checkTm (MkTmSeq tm1 tm2) ty = do ftvar <- freshMVar "seq"
 checkTm (MkUse u) t = do s <- inferUse u
                          unify t s
 checkTm (MkDCon (MkDataCon k xs)) ty =
-  do (dt, es, qs, ts) <- getCtr k
+  do (dt, args, ts) <- getCtr k
      addMark
-     qs' <- mapM makeFlexible qs
-     es' <- mapM (makeFlexibleAb . liftAbMod) es
+     args' <- mapM makeFlexibleTyArg args
      ts' <- mapM makeFlexible ts
-     unify ty (MkDTTy dt es' qs')
+     unify ty (MkDTTy dt args')
      mapM_ (uncurry checkTm) (zip xs ts')
 
 checkSComp :: SComp Desugared -> VType Desugared -> Contextual ()
@@ -166,19 +189,23 @@ checkSComp (MkSComp xs) ty = mapM_ (checkCls' ty) xs
         checkCls' ty cls@(MkCls pats tm) =
           do pushMarkCtx
              ps <- mapM (\_ -> freshPort "X") pats
-             q <- freshPeg "e" "X"
+             q <- freshPeg "" "X"
              checkCls cls ps q
              unify ty (MkSCTy (MkCType ps q))
              purgeMarks
 
-        freshPort :: Id -> Contextual (Port Desugared)
-        freshPort x = do ty <- MkFTVar <$> freshMVar x
-                         return $ MkPort (MkAdj M.empty) ty
+freshPort :: Id -> Contextual (Port Desugared)
+freshPort x = do ty <- MkFTVar <$> freshMVar x
+                 return $ MkPort (MkAdj M.empty) ty
 
-        freshPeg :: Id -> Id -> Contextual (Peg Desugared)
-        freshPeg x y = do v <- MkAbFVar <$> freshMVar x
-                          ty <- MkFTVar <$> freshMVar y
-                          return $ MkPeg (MkAb v M.empty) ty
+freshPeg :: Id -> Id -> Contextual (Peg Desugared)
+freshPeg x y = do v <- MkAbFVar <$> freshMVar x
+                  ty <- MkFTVar <$> freshMVar y
+                  return $ MkPeg (MkAb v M.empty) ty
+
+freshPegWithAb :: Ab Desugared -> Id -> Contextual (Peg Desugared)
+freshPegWithAb ab x = do ty <- MkFTVar <$> freshMVar x
+                         return $ MkPeg ab ty
 
 checkCls :: Clause Desugared -> [Port Desugared] -> Peg Desugared ->
             Contextual ()
@@ -196,7 +223,7 @@ checkCls (MkCls pats tm) ports (MkPeg ab ty)
                      purgeMarks
   | otherwise = throwError "number of patterns not equal to number of ports"
 
-checkPat :: Pattern -> Port Desugared -> Contextual [TermBinding]
+checkPat :: Pattern Desugared -> Port Desugared -> Contextual [TermBinding]
 checkPat (MkVPat vp) (MkPort _ ty) = checkVPat vp ty
 checkPat (MkCmdPat cmd xs g) (MkPort adj ty) =
   do (itf, qs, ts, y) <- getCmd cmd
@@ -206,10 +233,10 @@ checkPat (MkCmdPat cmd xs g) (MkPort adj ty) =
                   "command " ++ cmd ++ " not found in adjustment " ++
                   (show $ ppAdj adj)
        Just ps -> do addMark -- localise the following type variables
-                     qs' <- mapM makeFlexible qs
+                     qs' <- mapM makeFlexibleTyArg qs
                      ts' <- mapM makeFlexible ts
                      y' <- makeFlexible y
-                     mapM (uncurry unify) (zip ps qs')
+                     mapM (uncurry unifyTyArg) (zip ps qs')
                      bs <- fmap concat $ mapM (uncurry checkVPat) (zip xs ts')
                      kty <- contType y' adj ty
                      return ((MkMono g,kty) : bs)
@@ -223,27 +250,26 @@ contType x adj y =
   do amb <- getAmbient
      return $ MkSCTy $ MkCType [MkPort idAdj x] (MkPeg (plus amb adj) y)
 
-checkVPat :: ValuePat -> VType Desugared -> Contextual [TermBinding]
+checkVPat :: ValuePat Desugared -> VType Desugared -> Contextual [TermBinding]
 checkVPat (MkVarPat x) ty = return [(MkMono x, ty)]
 checkVPat (MkDataPat k xs) ty =
-  do (dt, es, qs, ts) <- getCtr k
+  do (dt, args, ts) <- getCtr k
      addMark
-     qs' <- mapM makeFlexible qs
-     es' <- mapM (makeFlexibleAb . liftAbMod) es
+     args' <- mapM makeFlexibleTyArg args
      ts' <- mapM makeFlexible ts
-     unify ty (MkDTTy dt es' qs')
+     unify ty (MkDTTy dt args')
      bs <- fmap concat $ mapM (uncurry checkVPat) (zip xs ts')
      return bs
 checkVPat (MkCharPat _) ty = unify ty MkCharTy >> return []
-checkVPat (MkStrPat _) ty = unify ty (desugaredStrTy []) >> return []
+checkVPat (MkStrPat _) ty = unify ty desugaredStrTy >> return []
 checkVPat (MkIntPat _) ty = unify ty MkIntTy >> return []
 -- checkVPat p ty = throwError $ "failed to match value pattern " ++
 --                  (show p) ++ " with type " ++ (show ty)
 
 -- Replace rigid type variables with flexible ones
 makeFlexible :: VType Desugared -> Contextual (VType Desugared)
-makeFlexible (MkDTTy id abs xs) =
-  MkDTTy <$> pure id <*> mapM makeFlexibleAb abs <*> mapM makeFlexible xs
+makeFlexible (MkDTTy id ts) =
+  MkDTTy id <$> mapM makeFlexibleTyArg ts
 makeFlexible (MkSCTy cty) = MkSCTy <$> makeFlexibleCType cty
 makeFlexible (MkRTVar x) = MkFTVar <$> (getContext >>= find')
   where find' BEmp = freshMVar x
@@ -256,17 +282,21 @@ makeFlexible ty = return ty
 makeFlexibleAb :: Ab Desugared -> Contextual (Ab Desugared)
 makeFlexibleAb (MkAb v m) = case v of
   MkAbRVar x -> do v' <- MkAbFVar <$> (getContext >>= (find' x))
-                   m' <- mapM (mapM makeFlexible) m
+                   m' <- mapM (mapM makeFlexibleTyArg) m
                    return $ MkAb v' m'
-  _ -> do m' <- mapM (mapM makeFlexible) m
+  _ -> do m' <- mapM (mapM makeFlexibleTyArg) m
           return $ MkAb v m'
   where find' x BEmp = freshMVar x
         find' x (es :< FlexMVar y _) | trimVar x == trimVar y = return y
         find' x (es :< Mark) = freshMVar x
         find' x (es :< _) = find' x es
 
+makeFlexibleTyArg :: TyArg Desugared -> Contextual (TyArg Desugared)
+makeFlexibleTyArg (VArg t)  = VArg <$> makeFlexible t
+makeFlexibleTyArg (EArg ab) = EArg <$> makeFlexibleAb ab
+
 makeFlexibleAdj :: Adj Desugared -> Contextual (Adj Desugared)
-makeFlexibleAdj (MkAdj m) = MkAdj <$> mapM (mapM makeFlexible) m
+makeFlexibleAdj (MkAdj m) = MkAdj <$> mapM (mapM makeFlexibleTyArg) m
 
 makeFlexibleCType :: CType Desugared -> Contextual (CType Desugared)
 makeFlexibleCType (MkCType ps q) = MkCType <$>
