@@ -1,0 +1,85 @@
+{- Same Fringe Problem
+
+   Definition: Two binary trees have the same fringe if they have exactly
+   the same leaves reading from left to right.
+
+   Problem: Given two binary trees decide whether they have the same fringe.
+
+   This problem can be elegantly solved using multi-handlers.
+-}
+
+--- start of standard stuff ---
+data Bool = tt | ff
+
+eqBool : {Bool -> Bool -> Bool}
+eqBool tt tt = tt
+eqBool ff ff = tt
+eqBool _ _   = ff
+
+if : {Bool -> {X} -> {X} -> X}
+if tt then _    = then!
+if ff _    else = else!
+
+data Prod X Y = pair X Y
+
+map : {X -> Y} -> List X -> List Y
+map f []        = []
+map f (x :: xs) = f x :: map f xs
+
+print : String -> [Console]Unit
+print s = map ouch s; unit
+
+println : String -> [Console]Unit
+println s = print s; print "\n"
+--- end of standard stuff ---
+
+--- start of solution ---
+data Tree X = branch (Tree X) (Tree X)
+            | leaf X
+
+interface Co X = yield : X -> Unit
+
+walkTree : { Tree X -> {[Co X]Unit} }
+walkTree t = {walkTree' t}
+
+walkTree' : { Tree X -> [Co X]Unit }
+walkTree' (leaf x) = yield x
+walkTree' (branch l r) = walkTree' l; walkTree' r
+
+sameFringe : { {[Co Bool]Unit} -> {[Co Bool]Unit} -> Bool }
+sameFringe l r = sameFringe' l! r!
+
+sameFringe' : { <Co Bool>Unit -> <Co Bool>Unit -> Bool }
+sameFringe' _ _ = tt
+sameFringe' <yield a -> l> <yield b -> r>
+   = if (eqBool a b)
+        {sameFringe' (l unit) (r unit)}
+        {ff}
+--- end of solution ---
+
+-- Examples
+ex1 : {Tree Bool}
+ex1! = leaf tt
+
+ex2 : {Tree Bool}
+ex2! = leaf ff
+
+ex3 : {Tree Bool}
+ex3! = branch (leaf tt) (branch (leaf ff) (leaf tt))
+
+ex4 : {Tree Bool}
+ex4! = branch (branch (leaf tt) (leaf ff)) (leaf tt)
+
+ex5 : {Tree Bool}
+ex5! = branch (branch (leaf ff) (leaf tt)) (leaf tt)
+
+examples : {List (Prod {Tree Bool} {Tree Bool})}
+examples! = [pair ex1 ex1, pair ex1 ex2, pair ex2 ex2, pair ex3 ex4, pair ex4 ex3, pair ex3 ex5]
+
+-- Driver
+main : {[Console]Unit}
+main! =
+  map { (pair l r) ->
+             if (sameFringe (walkTree l!) (walkTree r!))
+                {println "Same"}
+                {println "Different"} } examples!; unit
