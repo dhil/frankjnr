@@ -30,14 +30,14 @@ test! = print "M1 ";
         yield!;
         print "M3 ";
         yield!;
-        print "\n"
+        print "."
 
 interface Queue S = enqueue : S -> Unit
                   | dequeue : Maybe S
 
 data Proc = proc {[Queue Proc]Unit}
 
-pushProc : {[Queue Proc]Unit} -> [Queue Proc]Unit
+pushProc : {{[Queue Proc]Unit} -> [Queue Proc]Unit}
 pushProc p = enqueue (proc p)
 
 popProc : {[Queue Proc]Maybe Unit}
@@ -60,6 +60,9 @@ zipQueue []        qs <dequeue -> k>   = zipQueue (reverse qs) [] (k dequeue!)
 zipQueue (p :: ps) qs <dequeue -> k>   = zipQueue ps qs (k (just p))
 zipQueue ps        qs unit             = unit
 
+-- Dont delete these lines, they make this program into a unit test.
+-- #desc   examples/coop-factored.fk
+-- #return M1 M2 A1 A2 B1 M3 B2 .unit
+
 main : {[Console]Unit}
 main! = zipQueue [] [] (roundRobin test!)
-
