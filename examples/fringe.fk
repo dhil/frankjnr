@@ -39,15 +39,12 @@ data Tree X = branch (Tree X) (Tree X)
 
 interface Co X = yield : X -> Unit
 
-walkTree : { Tree X -> {[Co X]Unit} }
-walkTree t = {walkTree' t}
+walkTree : { Tree X -> [Co X]Unit }
+walkTree (leaf x) = yield x
+walkTree (branch l r) = walkTree l; walkTree r
 
-walkTree' : { Tree X -> [Co X]Unit }
-walkTree' (leaf x) = yield x
-walkTree' (branch l r) = walkTree' l; walkTree' r
-
-sameFringe : { {[Co Bool]Unit} -> {[Co Bool]Unit} -> Bool }
-sameFringe l r = sameFringe' l! r!
+sameFringe : { Tree Bool -> Tree Bool -> Bool }
+sameFringe l r = sameFringe' (walkTree l) (walkTree r)
 
 sameFringe' : { <Co Bool>Unit -> <Co Bool>Unit -> Bool }
 sameFringe' _ _ = tt
@@ -73,13 +70,18 @@ ex4! = branch (branch (leaf tt) (leaf ff)) (leaf tt)
 ex5 : {Tree Bool}
 ex5! = branch (branch (leaf ff) (leaf tt)) (leaf tt)
 
-examples : {List (Prod {Tree Bool} {Tree Bool})}
-examples! = [pair ex1 ex1, pair ex1 ex2, pair ex2 ex2, pair ex3 ex4, pair ex4 ex3, pair ex3 ex5]
+examples : {List (Prod (Tree Bool) (Tree Bool))}
+examples! = [ pair ex1! ex1!
+            , pair ex1! ex2!
+            , pair ex2! ex2!
+            , pair ex3! ex4!
+            , pair ex4! ex3!
+            , pair ex3! ex5!]
 
 -- Driver
 main : {[Console]Unit}
 main! =
   map { (pair l r) ->
-             if (sameFringe (walkTree l!) (walkTree r!))
+             if (sameFringe l r)
                 {println "Same"}
                 {println "Different"} } examples!; unit
